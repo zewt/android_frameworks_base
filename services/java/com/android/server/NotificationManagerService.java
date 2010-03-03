@@ -49,6 +49,8 @@ import android.os.IBinder;
 import android.os.Message;
 import android.os.Power;
 import android.os.Process;
+import android.os.PowerManager;
+import android.os.PowerManager.WakeLock;
 import android.os.RemoteException;
 import android.os.SystemProperties;
 import android.os.Vibrator;
@@ -101,6 +103,9 @@ class NotificationManagerService extends INotificationManager.Stub
     private boolean mNotificationScreenOn;
     private boolean mNotificationPulseEnabled;
 
+    private TrackballThread mThread;
+    private WakeLock mWakeLock;
+ 
     // for adb connected notifications
     private boolean mUsbConnected;
     private boolean mAdbEnabled = false;
@@ -117,7 +122,6 @@ class NotificationManagerService extends INotificationManager.Stub
     private boolean mBatteryCharging;
     private boolean mBatteryLow;
     private boolean mBatteryFull;
-    private NotificationRecord mLedNotification;
 
     private static final int BATTERY_LOW_ARGB = 0xFFFF0000; // Charging Low - red solid on
     private static final int BATTERY_MEDIUM_ARGB = 0xFFFFFF00;    // Charging - orange solid on
@@ -295,7 +299,8 @@ class NotificationManagerService extends INotificationManager.Stub
 
                 // light
                 mLights.clear();
-                mLedNotification = null;
+                if(mThread != null)
+                    mThread.mDone = true;
                 updateLightsLocked();
             }
         }
@@ -405,6 +410,11 @@ class NotificationManagerService extends INotificationManager.Stub
         mStatusBarService = statusBar;
         statusBar.setNotificationCallbacks(mNotificationCallbacks);
 
+        // Use partial wake lock to stay awake
+        PowerManager pm = (PowerManager) context.getSystemService(Context.POWER_SERVICE);
+        mWakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, TAG);
+        mWakeLock.setReferenceCounted(true);
+ 
         // Don't start allowing notifications until the setup wizard has run once.
         // After that, including subsequent boots, init with notifications turned on.
         // This works on the first boot because the setup wizard will toggle this
@@ -783,17 +793,27 @@ class NotificationManagerService extends INotificationManager.Stub
             }
 
             // this option doesn't shut off the lights
-
-            // light
-            // the most recent thing gets the light
-            mLights.remove(old);
-            if (mLedNotification == old) {
-                mLedNotification = null;
-            }
-            //Log.i(TAG, "notification.lights="
-            //        + ((old.notification.lights.flags & Notification.FLAG_SHOW_LIGHTS) != 0));
             if ((notification.flags & Notification.FLAG_SHOW_LIGHTS) != 0) {
+                boolean add = true;
+                for(int i = 0; i < mLights.size(); i++) {
+                    NotificationRecord nr = mLights.get(i);
+
+                    // Found a notification that we are already showing
+                    if (nr.pkg.equals(r.pkg) && nr.id == r.id) {
+                        
+                        // Update the color of the light if it has changed
+                        if (nr.notification.ledARGB != r.notification.ledARGB) {
+                            nr.notification.ledARGB = r.notification.ledARGB;
+            }
+
+                        add = false;
+                        break;
+                    }
+                }
+
+                if (add)
                 mLights.add(r);
+                
                 updateLightsLocked();
             } else {
                 if (old != null
@@ -863,10 +883,10 @@ class NotificationManagerService extends INotificationManager.Stub
         }
 
         // light
+        Log.d(TAG, "Trackball removing notification" + r);
         mLights.remove(r);
-        if (mLedNotification == r) {
-            mLedNotification = null;
-        }
+        if (mLights.size() == 0 && mThread != null)
+            mThread.mDone = true;
     }
 
     /**
@@ -1025,25 +1045,14 @@ class NotificationManagerService extends INotificationManager.Stub
             mHardware.setLightOff_UNCHECKED(HardwareService.LIGHT_ID_BATTERY);
         }
 
-        // handle notification lights
-        if (mLedNotification == null) {
-            // get next notification, if any
-            int n = mLights.size();
-            if (n > 0) {
-                mLedNotification = mLights.get(n-1);
-            }
-        }
-
         // we only flash if screen is off and persistent pulsing is enabled
-        if (mLedNotification == null || (mScreenOn && !mNotificationScreenOn) || !mNotificationPulseEnabled) {
-            mHardware.setLightOff_UNCHECKED(HardwareService.LIGHT_ID_NOTIFICATIONS);
-        } else {
-            mHardware.setLightFlashing_UNCHECKED(
-                    HardwareService.LIGHT_ID_NOTIFICATIONS,
-                    mLedNotification.notification.ledARGB,
-                    HardwareService.LIGHT_FLASH_TIMED,
-                    mLedNotification.notification.ledOnMS,
-                    mLedNotification.notification.ledOffMS);
+        Log.d(TAG, "Trackball notification seen");
+        if ((mScreenOn && !mNotificationScreenOn) || !mNotificationPulseEnabled) {
+            if (mThread != null)
+                mThread.mDone = true;
+        } else if (mLights.size() > 0 && mThread == null) {
+            mThread = new TrackballThread();
+            mThread.start();
         }
     }
 
@@ -1187,4 +1196,55 @@ class NotificationManagerService extends INotificationManager.Stub
             pw.println("  mSystemReady=" + mSystemReady);
         }
     }
+
+    private class TrackballThread extends Thread {
+        public boolean mDone = false;
+        private static final long FLASH_OFFSET = 300;
+
+        private void delay(long duration) {
+            if (duration > 0) {
+                try{
+                    sleep(duration);
+                }
+                catch (InterruptedException e) {} 
+            }
+        }
+
+        public void run() {
+            Process.setThreadPriority(Process.THREAD_PRIORITY_DISPLAY);
+            int currentIndex = 0;
+            NotificationRecord nr;
+
+            mWakeLock.acquire();
+
+            while (true) {
+                synchronized (mNotificationList) {
+
+                    if (mDone || mLights.size() == 0)
+                        break;
+
+                    ++currentIndex;
+                    if (currentIndex >= mLights.size())
+                        currentIndex = 0;
+
+                    nr = mLights.get(currentIndex);
+                }
+
+                mHardware.setLightFlashing_UNCHECKED(HardwareService.LIGHT_ID_NOTIFICATIONS,
+                        nr.notification.ledARGB, HardwareService.LIGHT_FLASH_TIMED,
+                        nr.notification.ledOnMS, nr.notification.ledOffMS);
+
+                delay(nr.notification.ledOnMS);
+
+                mHardware.setLightOff_UNCHECKED(HardwareService.LIGHT_ID_NOTIFICATIONS);
+                delay(nr.notification.ledOffMS);
+            }
+
+            mWakeLock.release();
+            
+            // Kill the thread since these notifications have been finished.
+            mThread = null;
+        }
+    };
+
 }
